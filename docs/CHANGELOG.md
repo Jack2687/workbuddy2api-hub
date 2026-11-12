@@ -1,5 +1,7 @@
 ## Unreleased
 
+- **CodeArts 并发名额占满时改为有界排队**（跟进 #740）：单账号并发上限默认 1，客户端的自动标题请求与首轮请求常常在同一瞬间到达；旧实现只等约 100ms 就回「没有可用的 CodeArts 账号：请在看板「账号」页添加并启用至少一个账号」，并经 `_codearts_error` 映射成 502，客户端把它当成配置错误、整轮直接失败（用户再发一次「继续」时名额已空出来，于是又正常）。现在 `open_chat` 在池里还有健康账号、只是并发名额被占满时最多等待 `busy_wait_seconds`（默认 10 秒，范围 0–120）秒；等不到才抛新增的 `CodeArtsBusy`，并在 OpenAI / Anthropic 两条错误通道映射为可重试的 429（带 `reset_at`），不再冒充「没有账号」。名额归还时通过 `Condition` 立即唤醒等待者；多账号时仍优先直接选空闲账号，不排队。`#740` 当年加的 50ms 缓冲保留为兜底，但不再是唯一手段。
+- 测试：`tests/_test_codearts_native.py` 新增「busy slot queue」10 项（排队后成功、确实等待、超时抛 `CodeArtsBusy`、文案不再误导、等待有上界）。
 - **CodeArts 请求积分不再恒为 0**（#866）：CodeArts 聊天 SSE 只返回 token，不返回逐请求 `credit`。网关现在在请求发出前读取账号累计已用积分，响应结束后按差值写入本次 usage 行；`chat/completions`、`responses`、`messages` 的流式与非流式共用同一结算点。采样失败、计数回退或上游已返回非零 `credit` 时不改写，且查询失败不会影响正常聊天。
 - **计费头的宽松兜底**（`WB_SANITIZE_LOOSE_BILLING`，默认 `0` = 关闭）：#853 / #854 把清洗作用域收紧成「整块都是 `cc_*` / `cch` 元数据」的形态，误删最少；但客户端一旦改字段名或多塞一个未知键，`_billing_payload_is_metadata()` 就判它「不是元数据」，整行原样留下——而这类行每个请求都不同，留在 system 首部等于每轮把整段前缀的 prompt 缓存打掉，命中率静默归零、没有任何报错可循。开关打开后，严格解析认不出但首行看着就是计费头（≥2 个 `cc_*=` / `cch=` 键值，且≤400 字符）时整段删除；续行只在自身也是合法元数据行时才被带走。默认关闭，行为与现在逐字节一致。
 - **Key 级日 token 限量**（`daily_token_limit`，单位 M，`0` = 不限）：新增按 Key 折叠的用量视图 `keytokens`（与账号维度的 `tokens` 是同一批行的两种折叠，不增加 I/O）。**先按 key 累加再判 uid 为空**：400 之类的失败行没有 `account` 字段，先在 uid 上跳过就会漏掉它们。超限时在**并发槽位之前**返回 `403 permission_error`（已超额的 Key 不该先排队等 `WB_CHAT_SLOT_WAIT` 秒再被拒），`/v1/messages` 走 Anthropic 错误信封。面板：编辑弹窗新增「日 token 限量 (M)」输入框与「日限 NM」徽标；`/settings/save` 在请求体缺该字段时沿用已存值，老面板保存不会把日限量清成 0。
