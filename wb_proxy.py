@@ -14741,6 +14741,93 @@ _SCHEMA_TYPE_MAP = {
 }
 _SCHEMA_VALID_TYPES = {"string", "number", "integer", "boolean", "array", "object", "null"}
 
+# Keyword shapes the upstream Go validator rejects outright with code 11129.
+# Verified one construct at a time against copilot.tencent.com: each of these
+# alone yields 400/11129, and everything else in the list below still passes.
+_SCHEMA_NUMERIC_KEYS = (
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+    "multipleOf", "minLength", "maxLength", "minItems", "maxItems",
+    "minProperties", "maxProperties",
+)
+_SCHEMA_BOOLEAN_KEYS = ("uniqueItems", "deprecated", "readOnly", "writeOnly")
+_SCHEMA_STRING_KEYS = ("description", "title", "format", "pattern")
+
+
+def _coerce_schema_number(value):
+    """Numbers only. Numeric strings are converted; anything else is dropped."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            num = float(value.strip())
+        except (TypeError, ValueError):
+            return None
+        return int(num) if num.is_integer() else num
+    return None
+
+
+def _coerce_schema_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
+
+
+def _harden_schema_keywords(s):
+    """Make every keyword's value type acceptable to the upstream validator.
+
+    Steps 1-8 of `_deep_normalize_schema` repair `type`, `properties`,
+    `required` and `items`; they leave the constraint keywords untouched, so a
+    client that serializes numbers as strings reaches the upstream unchanged and
+    the whole request is rejected (code 11129).
+    """
+    for key in _SCHEMA_NUMERIC_KEYS:
+        if key not in s:
+            continue
+        num = _coerce_schema_number(s[key])
+        if num is None:
+            s.pop(key, None)
+        else:
+            s[key] = num
+    for key in _SCHEMA_BOOLEAN_KEYS:
+        if key not in s:
+            continue
+        flag = _coerce_schema_bool(s[key])
+        if flag is None:
+            s.pop(key, None)
+        else:
+            s[key] = flag
+    for key in _SCHEMA_STRING_KEYS:
+        if key not in s:
+            continue
+        value = s[key]
+        if value is None:
+            s.pop(key, None)
+        elif not isinstance(value, str):
+            s[key] = str(value)
+    # additionalProperties is a bool or a nested schema, never a string
+    if "additionalProperties" in s:
+        extra = s["additionalProperties"]
+        if isinstance(extra, dict):
+            _deep_normalize_schema(extra)
+        else:
+            flag = _coerce_schema_bool(extra)
+            if flag is None:
+                s.pop("additionalProperties", None)
+            else:
+                s["additionalProperties"] = flag
+    if "enum" in s and not isinstance(s["enum"], list):
+        s.pop("enum", None)
+    if "examples" in s and not isinstance(s["examples"], list):
+        s.pop("examples", None)
+    # no keyword ever means "null"; the upstream rejects the request outright
+    for key in [k for k, v in s.items() if v is None]:
+        s.pop(key, None)
+    return s
+
 
 def _deep_normalize_schema(s):
     """Recursively clean and normalize JSON Schema for upstream Go validator."""
@@ -14823,6 +14910,7 @@ def _deep_normalize_schema(s):
                 if isinstance(sub, dict):
                     _deep_normalize_schema(sub)
 
+    _harden_schema_keywords(s)
     return s
 
 
@@ -14857,6 +14945,8 @@ def _normalize_tool_parameters(fn):
         p["properties"] = {}
     _deep_normalize_schema(p)
     fn["parameters"] = p
+    if fn.get("description") is not None and not isinstance(fn["description"], str):
+        fn["description"] = str(fn["description"])
 
 
 def normalize_tools(obj):
