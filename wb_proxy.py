@@ -30,6 +30,7 @@ from collections import deque
 import re
 import atexit
 import json
+import math
 import os
 import queue
 import random
@@ -14885,11 +14886,13 @@ def _coerce_schema_number(value):
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
-        return value
+        return value if math.isfinite(value) else None
     if isinstance(value, str):
         try:
             num = float(value.strip())
         except (TypeError, ValueError):
+            return None
+        if not math.isfinite(num):
             return None
         return int(num) if num.is_integer() else num
     return None
@@ -28164,6 +28167,7 @@ class Handler(BaseHTTPRequestHandler):
         """把 CodeArts 异常落一条用量行，再回一个可读的 OpenAI 错误。"""
         elapsed = int((time.time() - t_start) * 1000)
         err_type = "invalid_request_error"
+        reset_at = None
         if isinstance(exc, wb_codearts.CodeArtsBadRequest):
             status = 400
         elif isinstance(exc, wb_codearts.CodeArtsAuthError):
@@ -28172,13 +28176,19 @@ class Handler(BaseHTTPRequestHandler):
             status = 409
         elif isinstance(exc, wb_codearts.CodeArtsConflict):
             status = 409
+        elif isinstance(exc, wb_codearts.CodeArtsBusy):
+            # 账号都在忙，不是「没有账号」这种配置错误：429 + reset_at 让
+            # 客户端（DSH 的 retryPolicy 会据此重试）短暂退避，而不是把整轮
+            # 运行判死。
+            status, err_type = 429, "rate_limit_error"
+            reset_at = time.time() + 2
         elif isinstance(exc, wb_codearts.CodeArtsError) and exc.status == 429:
             status, err_type = 429, "rate_limit_error"
         else:
             status = 502
         record_error(model, status, str(exc)[:200], elapsed_ms=elapsed,
                      realm=realm, key=self._key_id())
-        return self._error(status, str(exc), err_type)
+        return self._error(status, str(exc), err_type, reset_at=reset_at)
 
     def _handle_codearts_chat(self, payload, session_key, realm):
         """`/v1/chat/completions` 的 CodeArts 分支。"""
@@ -28227,11 +28237,15 @@ class Handler(BaseHTTPRequestHandler):
                 realm="codearts", effort=effort, allow_web_tools=False)
 
     def _codearts_anthropic_error(self, model, exc, t_start, realm):
+        reset_at = None
         if isinstance(exc, wb_codearts.CodeArtsBadRequest):
             status, etype = 400, "invalid_request_error"
         elif isinstance(exc, (wb_codearts.CodeArtsNotFound,
                               wb_codearts.CodeArtsConflict)):
             status, etype = 409, "invalid_request_error"
+        elif isinstance(exc, wb_codearts.CodeArtsBusy):
+            status, etype = 429, "rate_limit_error"
+            reset_at = time.time() + 2
         elif isinstance(exc, wb_codearts.CodeArtsError) and exc.status == 429:
             status, etype = 429, "rate_limit_error"
         else:
@@ -28239,7 +28253,7 @@ class Handler(BaseHTTPRequestHandler):
         record_error(model, status, str(exc)[:200],
                      elapsed_ms=int((time.time() - t_start) * 1000),
                      realm=realm, key=self._key_id())
-        return self._anthropic_error(status, str(exc), etype)
+        return self._anthropic_error(status, str(exc), etype, reset_at=reset_at)
 
     def _handle_codearts_messages(self, chat_req, session_key, model, want_stream,
                                   fp, t_start):

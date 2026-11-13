@@ -307,6 +307,17 @@ check("deprecated 'false' -> False", props["d"].get("deprecated") is False, prop
 check("additionalProperties 'false' -> False",
       fn["parameters"].get("additionalProperties") is False, fn["parameters"])
 
+fn = {"name": "t15b", "parameters": {"type": "object", "properties": {
+    "a": {"type": "number", "minimum": "NaN"},
+    "b": {"type": "number", "maximum": "Infinity"},
+    "c": {"type": "number", "multipleOf": float("inf")},
+}}}
+P._normalize_tool_parameters(fn)
+props = fn["parameters"]["properties"]
+check("NaN string dropped", "minimum" not in props["a"], props["a"])
+check("Infinity string dropped", "maximum" not in props["b"], props["b"])
+check("infinite float dropped", "multipleOf" not in props["c"], props["c"])
+
 print()
 print("[16] enum / examples / string keywords")
 fn = {"name": "t16", "parameters": {"type": "object", "properties": {
